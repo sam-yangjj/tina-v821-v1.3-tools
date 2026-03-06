@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+
+import os, sys
+import argparse
+import re
+import subprocess
+
+sys.path.append(os.path.dirname(__file__)+'/pylib/json5-0.9.25')
+import json5
+
+parser = argparse.ArgumentParser()
+parser.add_argument("buildconfig", default="../.buildconfig",
+            help="the buildconfig file")
+parser.add_argument("--config", help="configuration ramdisk that need to gen")
+args = parser.parse_args()
+
+if not os.path.exists(args.buildconfig):
+    print("%s not exists" % args.buildconfig)
+    sys.exit(1)
+
+configs = {}
+
+def do_cmd(cmd, env=None):
+    if env:
+        s = subprocess.Popen(cmd, env=env, shell=True)
+    else:
+        s = subprocess.Popen(cmd, shell=True)
+    return_code = s.wait()
+    return return_code
+
+def do_cmd_with_output(cmd, env=None):
+    if env:
+        s = subprocess.Popen(cmd, env=env, shell=True, stdout=subprocess.PIPE)
+    else:
+        s = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+    output = s.communicate()[0]
+    return_code = s.returncode
+    return return_code, output.decode()
+
+def _load_config(filepath):
+    pattern = re.compile(r'^export ([^\s]+)=(.*)$')
+    with open(filepath, "r") as f:
+        for line in f:
+            match = pattern.search(line)
+            if not match:
+                continue
+            key = match.group(1)
+            val = match.group(2)
+            configs[key] = val
+
+def parse_var(vars, var):
+    max_ref = 10
+    while max_ref > 0:
+        for k, v in vars.items():
+            var = var.replace('${%s}' % (k), v)
+        if '$' not in var:
+            break
+        max_ref = max_ref - 1
+    if '$' in var:
+        print('unknow \"{}\" var.'.format(var))
+        sys.exit(1)
+    return var
+
+def copy_file(config_file):
+    global configs
+
+    if not os.path.exists(config_file):
+        print('{} is not exist'.format(config_file))
+        sys.exit(1)
+
+    with open(config_file, "r") as json_file:
+        data = json5.load(json_file)
+
+    if 'auto_copy' not in data.keys():
+        print('{} is not exist, skip'.format('auto_copy'))
+        sys.exit(1)
+
+    if 'status' in data.keys() and data['status'] != 'okay':
+        print('auto_update_usr status != \'okay\', skip...')
+        return
+
+    builtin_var = {}
+    ignore_builtin = [
+        'auto_copy', 'status'
+    ]
+
+    for k1, v1 in data.items():
+        if not isinstance(v1, str):
+            continue
+        if k1 in ignore_builtin:
+            continue
+        builtin_var[k1] = v1
+
+    # prepare default builtin var
+    builtin_var['rootfs'] = '{}/out/{}/{}/{}/build_dir/target/root-{}-{}'.format(configs['LICHEE_TOP_DIR'],
+                configs['LICHEE_IC'], configs['LICHEE_BOARD'], configs['LICHEE_LINUX_DEV'],
+                configs['LICHEE_IC'], configs['LICHEE_BOARD'])
+    builtin_var['configs'] = configs['LICHEE_BOARD_CONFIG_DIR']
+    builtin_var['plat'] = '{}/openwrt/target/{}/{}-{}'.format(
+                configs['LICHEE_TOP_DIR'], configs['LICHEE_IC'],
+                configs['LICHEE_IC'], configs['LICHEE_BOARD'])
+    builtin_var.update(configs.copy())
+
+    custom_env = configs.copy()
+    custom_env.update(os.environ.copy())
+
+    if 'dir' not in data.keys():
+        ramdisk_dir = configs['LICHEE_BOARD_CONFIG_DIR'] + '/ramdisk'
+    else:
+        ramdisk_dir = parse_var(builtin_var, data['dir'])
+
+    print('update usr dir: {}'.format(ramdisk_dir))
+
+    if 'prep_cmd' in data.keys():
+        for v in data['prep_cmd']:
+            v = parse_var(builtin_var, v)
+            print('do_cmd: {}'.format(v))
+            ret, out = do_cmd_with_output(v, custom_env)
+            if ret != 0:
+                print('do_cmd: {} failed'.format(v))
+                print('{}'.format(out))
+
+    if 'auto_copy' in data.keys():
+        for k1, v1 in data['auto_copy'].items():
+            v1 = parse_var(builtin_var, v1)
+            print('cp file: {} -> {}'.format(v1, k1))
+            if not os.path.exists(v1):
+                print('{} is not exist, skip...'.format(v1))
+                continue
+            k1 = ramdisk_dir + '/' + k1
+            if not os.path.exists(os.path.dirname(k1)):
+                do_cmd('mkdir -p {}'.format(os.path.dirname(k1)))
+            do_cmd('cp -rd {} {}'.format(v1, k1))
+
+    if 'auto_remove' in data.keys():
+        lichee_flash = configs.get('LICHEE_FLASH', os.getenv('LICHEE_FLASH'))
+        print('auto_remove:{}'.format(lichee_flash.lower()))
+        if format(lichee_flash.lower()) in data['auto_remove']:
+            remove_items = data['auto_remove'].get(lichee_flash.lower(), [])
+            for item in remove_items:
+                item = parse_var(builtin_var, item)
+                print('rm -rf:{}'.format(item))
+                do_cmd('rm -rf {}'.format(item))
+
+    if 'post_cmd' in data.keys():
+        lichee_flash = configs.get('LICHEE_FLASH', os.getenv('LICHEE_FLASH'))
+        print('post_cmd:{}'.format(lichee_flash.lower()))
+        if format(lichee_flash.lower()) in data['post_cmd']:
+            post_cmd = data['post_cmd'].get(lichee_flash.lower(), [])
+            for v in post_cmd:
+                v = parse_var(builtin_var, v)
+                print('do_cmd: {}'.format(v))
+                ret, out = do_cmd_with_output(v, custom_env)
+                if ret != 0:
+                    print('do_cmd: {} failed'.format(v))
+                    print('{}'.format(out))
+
+if __name__ == "__main__":
+    _load_config(args.buildconfig)
+    copy_file(args.config)

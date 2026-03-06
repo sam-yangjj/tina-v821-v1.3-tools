@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+
+import os, sys
+import argparse
+import re
+import subprocess
+import time
+import pprint
+
+sys.path.append(os.path.dirname(__file__) + '/pylib/json5-0.9.25')
+import json5
+
+parser = argparse.ArgumentParser()
+parser.add_argument("buildconfig", default="../.buildconfig",
+                    help="the buildconfig file")
+args = parser.parse_args()
+
+if not os.path.exists(args.buildconfig):
+    print("%s not exists" % args.buildconfig)
+    sys.exit(1)
+
+configs = {}
+global_config_dict = {}
+
+board_config_name = None
+board_config_dir = None
+sys_partition_path = None
+search_list = None
+diff_summary = None
+top_dir = None
+syconfig_path = None
+
+
+def do_cmd(cmd, env=None):
+    if env:
+        s = subprocess.Popen(cmd, env=env, shell=True)
+    else:
+        s = subprocess.Popen(cmd, shell=True)
+    return_code = s.wait()
+    return return_code
+
+
+def do_cmd_with_output(cmd, env=None):
+    if env:
+        s = subprocess.Popen(cmd, env=env, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    else:
+        s = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output, error_output = s.communicate()
+    return_code = s.returncode
+    return return_code, output.decode(), error_output.decode()
+
+
+def backup_file(target):
+    file_name = target + '.backup'
+    if not os.path.exists(file_name):
+        do_cmd('cp {} {}'.format(target, file_name))
+
+
+def restore_file(target):
+    file_name = target + '.backup'
+    do_cmd('mv {} {}'.format(file_name, target))
+
+
+def record_diff(target):
+    file_name = target + '.backup'
+    do_cmd('echo "diff {}" >> {}'.format(target, diff_summary))
+    do_cmd('diff {} {} >> {}'.format(file_name, target, diff_summary))
+    do_cmd('rm {}'.format(file_name))
+
+
+def _load_config(filepath):
+    pattern = re.compile(r'^export ([^\s]+)=(.*)$')
+    with open(filepath, "r") as f:
+        for line in f:
+            match = pattern.search(line)
+            if not match:
+                continue
+            key = match.group(1)
+            val = match.group(2)
+            configs[key] = val
+
+
+def get_lichee_flash_from_sys_config(syconfig_path):
+    if os.path.exists(syconfig_path):
+        with open(syconfig_path, 'r') as f:
+            for line in f:
+                if line.startswith('storage_type'):
+                    storage_type = line.split('=')[1].strip()
+                    break
+
+    if storage_type == "3":
+        return "nor"
+    elif storage_type == "5":
+        return "nand"
+    else:
+        return "default"
+
+
+def init_cfgval():
+    global board_config_name
+    global board_config_dir
+    global sys_partition_path
+    global search_list
+    global top_dir
+    global syconfig_path
+
+    board_config_dir = configs['LICHEE_BOARD_CONFIG_DIR']
+    linux_dev = configs['LICHEE_LINUX_DEV']
+    kerenl_ver = configs['LICHEE_KERN_VER']
+
+    search_list = [
+        # 1. ${LICHEE_BOARD_CONFIG_DIR}/${LICHEE_LINUX_DEV}/
+        '{}/{}'.format(board_config_dir, linux_dev),
+        # 2. ${LICHEE_BOARD_CONFIG_DIR}/${LICHEE_KERN_VER}/
+        '{}/{}'.format(board_config_dir, kerenl_ver),
+        # 3. ${LICHEE_BOARD_CONFIG_DIR}/
+        '{}'.format(board_config_dir),
+        # 4. ${LICHEE_BOARD_CONFIG_DIR}/../default/
+        '{}/../default'.format(board_config_dir),
+    ]
+
+    if board_config_dir is None:
+        print("LICHEE_BOARD_CONFIG_DIR not set in %s" % args.buildconfig)
+        sys.exit(1)
+
+    board_config_name = os.path.basename(board_config_dir)
+
+    syconfig_path = board_config_dir + '/sys_config.fex'
+    if not os.path.exists(syconfig_path):
+        print("%s is not exists" % syconfig_path)
+        sys.exit(1)
+
+    top_dir = configs['LICHEE_TOP_DIR']
+    if not os.path.exists(top_dir):
+        print("%s is not exists" % top_dir)
+        sys.exit(1)
+
+    lichee_ic = configs['LICHEE_IC']
+    if lichee_ic is None:
+        print("%s is not exists" % lichee_ic)
+        sys.exit(1)
+
+    lichee_flash = configs['LICHEE_FLASH']
+    if lichee_flash is None:
+        print("%s is not exists" % lichee_flash)
+        sys.exit(1)
+
+    if lichee_flash == 'nor':
+        for search in search_list:
+            sys_partition_path = '{}/sys_partition_nor.fex'.format(search)
+            if os.path.exists(sys_partition_path):
+                break
+        if not os.path.exists(sys_partition_path):
+            print("%s is not exists" % sys_partition_path)
+            sys.exit(1)
+    else:
+        for search in search_list:
+            sys_partition_path = '{}/sys_partition.fex'.format(search)
+            if os.path.exists(sys_partition_path):
+                break
+        if not os.path.exists(sys_partition_path):
+            print("%s is not exists" % sys_partition_path)
+            sys.exit(1)
+
+
+def parse_partition_table_from_file(file_path: str) -> list:
+    """
+    Parses a partition table from a configuration file and returns a list of partitions.
+
+    :param file_path: str
+        The path to the configuration file containing the partition details.
+
+    :return: list
+        A list of dictionaries, each representing a partition with its attributes.
+    """
+    partitions = []  # List to store all the parsed partitions
+    partition = {}  # Temporary dictionary to store a single partition's details
+
+    # Open the file and read its content
+    with open(file_path, 'r') as file:
+        for line in file:
+            line = line.strip()  # Remove leading/trailing whitespace
+
+            # Skip empty or comment lines
+            if not line or line.startswith(';'):
+                continue
+
+            # Handle the start of a partition
+            if line.startswith('[partition]'):
+                if partition:
+                    partitions.append(partition)  # Save the current partition if data exists
+                partition = {}  # Start a new partition
+
+            # Parse key-value pairs
+            elif '=' in line:
+                key, value = line.split('=', 1)
+                key = key.strip()  # Remove leading/trailing spaces from the key
+                value = value.strip()  # Remove leading/trailing spaces from the value
+
+                # Handle different fields
+                if key == 'name':
+                    partition['name'] = value
+                elif key == 'size':
+                    partition['size'] = int(value)  # Convert size to integer
+                elif key == 'downloadfile':
+                    partition['downloadfile'] = value.strip('"')  # Remove quotes around downloadfile
+                elif key == 'ro':
+                    partition['ro'] = int(value)  # Convert ro to integer (assumed to be 0 or 1)
+                elif key == 'user_type':
+                    partition['user_type'] = value.strip()  # Strip any extra spaces around user_type
+
+    # Add the last partition if available
+    if partition:
+        partitions.append(partition)
+
+    return partitions  # Return the list of parsed partitions
+
+
+def update_partition_size(file_path, name, new_size):
+    """
+    Updates the size of a specified partition in a configuration file.
+
+    :param file_path: str
+        The path to the configuration file that contains the partition details.
+
+    :param name: str
+        The name of the partition whose size needs to be updated.
+
+    :param new_size: str
+        The new size to set for the specified partition.
+    """
+    # Open the file in read mode with UTF-8 encoding to read all lines
+    with open(file_path, 'r', encoding='utf-8') as file:
+        lines = file.readlines()  # Read all lines into a list
+
+    updated = False  # Flag to track if the partition has been updated
+    in_partition = False  # Flag to track if we are currently inside a partition
+
+    # Iterate through each line in the configuration file
+    for i in range(len(lines)):
+        line = lines[i].strip()  # Remove leading/trailing whitespace
+
+        # Detect the start of a new partition section
+        if line.startswith('[partition]'):
+            in_partition = True  # Mark that we are inside a partition
+            current_partition_name = None  # Reset the current partition name
+
+        # If we are inside a partition, process the lines within it
+        elif in_partition:
+            # Check for the partition name and capture it
+            if line.startswith('name'):
+                match = re.match(r'name\s*=\s*(.*)', line)  # Use regex to extract the name
+                if match:
+                    current_partition_name = match.group(1).strip()  # Store the partition name
+
+            # Update the size of the specified partition if the name matches
+            if current_partition_name == name and line.startswith('size'):
+                # Align the `=` sign for neat formatting
+                indent = ' ' * 8
+                lines[i] = f'    size{indent} = {new_size}\n'  # Update the size with proper indentation
+                updated = True  # Set the flag indicating an update occurred
+                break  # Exit the loop since we've made the update
+
+            # Check for the end of the partition section
+            if line.startswith('['):  # A new section starts, meaning the partition is finished
+                in_partition = False  # Reset the flag to stop processing the current partition
+
+    # If the partition was updated, write the changes back to the file
+    if updated:
+        with open(file_path, 'w', encoding='utf-8') as file:
+            file.writelines(lines)  # Write the modified lines back to the file
+    else:
+        # If no update was made (partition not found), inform the user
+        print(f"Partition '{name}' not found.")
+
+
+def extract_names(data):
+    """
+    Extracts the 'name' values from items that contain 'name', 'size', and 'downloadfile' keys.
+
+    :param data: A list of dictionaries, each containing 'name', 'size', and 'downloadfile'.
+    :return: A list of 'name' values from the items that contain all three keys.
+    """
+    # Extract 'name' values from items that contain 'name', 'size', and 'downloadfile' keys
+    names = [item['name'] for item in data if 'name' in item and 'size' in item and 'downloadfile' in item]
+    return names
+
+
+def align_to_128(sector_size):
+    """
+    Aligns the given sector size to the nearest multiple of 128.
+
+    :param sector_size: The sector size to be aligned.
+    :return: The sector size aligned to the nearest multiple of 128.
+    """
+    # Calculate and return the closest multiple of 128
+    return (sector_size + 127) // 128 * 128
+
+
+def align_to_8(sector_size):
+    """
+    Aligns the given sector size to the nearest multiple of 8.
+
+    :param sector_size: The sector size to be aligned.
+    :return: The sector size aligned to the nearest multiple of 8.
+    """
+    # Calculate and return the closest multiple of 8
+    return (sector_size + 7) // 8 * 8
+
+
+def extract_dl_file_size(error_log):
+    """
+    Extracts the download file size from the error log by searching for a pattern.
+
+    :param error_log: The error log string containing the file size information.
+    :return: The extracted file size as an integer, or None if the pattern is not found.
+    """
+    # Search for the pattern 'dl_file_size = <number> sector' in the error log
+    match = re.search(r'dl_file_size\s*=\s*(\d+)\s*sector', error_log)
+
+    # If the pattern is found, return the extracted file size
+    if match:
+        return int(match.group(1))
+
+    # Return None if the pattern is not found
+    return None
+
+
+def try_pack_and_resize(sys_partition_path, table_name, base_alignment, custom_env):
+    """
+    Attempts to update the partition size and pack. If packing fails, it adjusts the partition size and retries.
+    If it fails again, it restores the file and exits the program.
+
+    :param sys_partition_path: Path to the system partition
+    :param table_name: The partition table name
+    :param base_alignment: The base alignment value, either 128 or 8
+    :param custom_env: Custom environment variables for the build command
+    :return: None, exits the program on failure
+    """
+    # Update the partition size
+    update_partition_size(sys_partition_path, table_name, base_alignment)
+
+    # Attempt to pack
+    code, ret, _ = do_cmd_with_output(f'bash {top_dir}/build.sh pack', custom_env)
+
+    if code != 0:  # If packing fails
+        # Adjust the partition size based on the alignment
+        dl_file_size = extract_dl_file_size(ret)
+        if dl_file_size is not None:
+            if base_alignment == 128:
+                resize_size = align_to_128(dl_file_size)
+            else:
+                resize_size = align_to_8(dl_file_size)
+
+            # Update partition size and attempt to pack again
+            update_partition_size(sys_partition_path, table_name, resize_size)
+        else:
+            raise RuntimeError("Extract file size fail!")
+
+def progress_bar(iterable, process_name, total=None, bar_length=40):
+    """
+    A progress bar that also displays the current table name.
+    :param iterable: The iterable object (e.g., list, range, etc.)
+    :param total: The total number of iterations, required if the iterable length is unknown
+    :param bar_length: The length of the progress bar (default 40)
+    """
+    if total is None:
+        total = len(iterable)
+
+    total = total + 1
+
+    for i, item in enumerate(iterable, 1):
+        # Calculate the progress
+        percent = (i / total) * 100
+        filled_length = int(bar_length * i // total)
+        bar = '#' * filled_length + '-' * (bar_length - filled_length)
+
+        # Print the progress bar on the same line
+        space = ' ' * 200
+        sys.stdout.write(f'\r{space}')
+        sys.stdout.write(f'\rProgress {process_name}: [{bar}] {percent:.2f}% Striping Partition: {item}')
+        sys.stdout.flush()
+
+        yield item  # Yield the current item in the iterable
+
+        time.sleep(0.1)
+
+    # Print a newline after the progress bar completes
+    space = ' ' * 200
+    sys.stdout.write(f'\r{space}')
+    sys.stdout.write(f'\rProgress {process_name}: [########################################] 100.00% - Processing: Done!    \n')
+    sys.stdout.flush()  # Ensure the final output is printed immediately
+    sys.stdout.write('\n')
+
+
+def try_best_partition_size():
+    global global_config_dict
+    global syconfig_path
+
+    lichee_flash = get_lichee_flash_from_sys_config(syconfig_path)
+
+    backup_file(sys_partition_path)
+    custom_env = {}
+    custom_env.update(os.environ.copy())
+
+    base_alignment = 0
+
+
+    if lichee_flash == "nand":
+        if global_config_dict["partition_align"] == "504":
+            base_alignment = 504
+        else:
+            base_alignment = 248
+    else:
+        base_alignment = 128
+        if global_config_dict["partition_align"] == "4K":
+            base_alignment = 8
+        else:
+            base_alignment = 128
+
+    partition_table_names = global_config_dict["selected_partition"]
+
+    try:
+        if isinstance(partition_table_names, str):
+            try_pack_and_resize(sys_partition_path, partition_table_names, base_alignment, custom_env)
+        else:
+            for table_name in progress_bar(partition_table_names, "Minimal Part", total=len(partition_table_names)):
+                try_pack_and_resize(sys_partition_path, table_name, base_alignment, custom_env)
+            # try to pack again
+            for table_name in progress_bar(partition_table_names, "Check Status", total=len(partition_table_names)):
+                try_pack_and_resize(sys_partition_path, table_name, base_alignment, custom_env)
+        print("Check pack info...")
+        code = do_cmd(f'bash {top_dir}/build.sh pack', custom_env)
+        if code == 1:  # If packing fails again
+            print("## pack fail. restore file ##")
+            restore_file(sys_partition_path)
+    except Exception as e:
+        print(f"Error during pack and resize process: {e}")
+        restore_file(sys_partition_path)
+    finally:
+        print("pack done.")
+        record_diff(sys_partition_path)
+
+
+def init_cli_config():
+    global global_config_dict
+    global syconfig_path
+
+    lichee_flash = get_lichee_flash_from_sys_config(syconfig_path)
+
+    if lichee_flash == "nand":
+        print("Choose the alignment for the partition size (SPI NAND UBI):")
+        print("\t1. 248 - default")
+        print("\t2. 504")
+
+        choice = input("Enter the number of your choice (1 or 2) [1. 248]: ")
+        if choice == "1":
+            global_config_dict["partition_align"] = "248"
+        elif choice == "2":
+            global_config_dict["partition_align"] = "504"
+        else:
+            global_config_dict["partition_align"] = "248"
+
+        print("You choose {}\n".format(global_config_dict["partition_align"]))
+    else:
+        print("Choose the alignment for the partition size:")
+        print("\t1. 64K - default")
+        print("\t2. 4K")
+
+        choice = input("Enter the number of your choice (1 or 2) [1. 64K]: ")
+        if choice == "1":
+            global_config_dict["partition_align"] = "64K"
+        elif choice == "2":
+            global_config_dict["partition_align"] = "4K"
+        else:
+            global_config_dict["partition_align"] = "64K"
+
+        print("You choose {}\n".format(global_config_dict["partition_align"]))
+
+    partition_table = parse_partition_table_from_file(sys_partition_path)
+    partition_table_names = extract_names(partition_table)
+
+    print("Choose the partition for strip:")
+    print("\t1. ALL - default")
+    for i, name in enumerate(partition_table_names, start=2):
+        print(f"\t{i}. {name}")
+
+    choice = input("Enter the number of your choice [1. ALL]: ")
+    if choice == "1":
+        global_config_dict["selected_partition"] = partition_table_names
+    else:
+        try:
+            global_config_dict["selected_partition"] = partition_table_names[int(choice) - 2]
+        except (ValueError, IndexError):
+            global_config_dict["selected_partition"] = partition_table_names
+
+    print("You choose {}\n".format(global_config_dict["selected_partition"]))
+
+
+if __name__ == "__main__":
+    try:
+        diff_summary = '{}/.auto_update_partition.diff'.format(os.getcwd())
+        if os.path.exists(diff_summary):
+            do_cmd('rm {}'.format(diff_summary))
+        _load_config(args.buildconfig)
+        init_cfgval()
+        init_cli_config()
+        try_best_partition_size()
+        if os.path.exists(diff_summary):
+            print('================================== dump modify diff ==================================')
+            with open(diff_summary, 'r') as f:
+                for line in f:
+                    print(line[:-1])
+            print('==================================   dump   end   ==================================')
+            do_cmd('rm {}'.format(diff_summary))
+    except KeyboardInterrupt:
+        print("\n")
+        pass
+    except Exception as e:
+        print("auto_update_partition Internal error: {}: {}".format(type(e), str(e)))

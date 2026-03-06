@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+
+import os, sys
+import argparse
+import re
+import subprocess
+import pprint
+
+sys.path.append(os.path.dirname(__file__) + '/pylib/json5-0.9.25')
+import json5
+
+parser = argparse.ArgumentParser()
+parser.add_argument("buildconfig", default="../.buildconfig",
+                    help="the buildconfig file")
+parser.add_argument("--config", help="configuration items that need to loaded")
+args = parser.parse_args()
+
+if not os.path.exists(args.buildconfig):
+    print("%s not exists" % args.buildconfig)
+    sys.exit(1)
+
+configs = {}
+syconfig_path = None
+build_dir = None
+kernel_dts_path = None
+uboot_dts_path = None
+kernel_defconf = None
+top_dir = None
+kerenl_ver = None
+board_config_dir = None
+board_config_name = None
+lichee_ic = None
+kernel_src_path = None
+kernel_cross_compile = None
+bsp_path = None
+search_list = None
+
+new_board_name = None
+new_board_tina_name = None
+new_board_rtos_name = None
+
+rtos_project = None
+rtos_device = None
+rtos_plat = None
+
+diff_summary = None
+prepare_note = None
+finish_note = None
+check_distclean = None
+
+
+def do_cmd(cmd, env=None):
+    # print(f"CMD: {cmd}")
+    if env:
+        s = subprocess.Popen(cmd, env=env, shell=True)
+    else:
+        s = subprocess.Popen(cmd, shell=True)
+    return_code = s.wait()
+    return return_code
+
+
+def do_cmd_with_output(cmd, env=None):
+    # print(f"CMD: {cmd}")
+    if env:
+        s = subprocess.Popen(cmd, env=env, shell=True, stdout=subprocess.PIPE)
+    else:
+        s = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+    output = s.communicate()[0]
+    return_code = s.returncode
+    return return_code, output.decode()
+
+
+def _load_config(filepath):
+    pattern = re.compile(r'^export ([^\s]+)=(.*)$')
+    with open(filepath, "r") as f:
+        for line in f:
+            match = pattern.search(line)
+            if not match:
+                continue
+            key = match.group(1)
+            val = match.group(2)
+            configs[key] = val
+    # pprint.pprint(configs)
+
+
+def print_ascii_logo():
+    ascii_art = '''
+ _______             _____             __        ___                   __
+/_  __(_)__  ___ _  / ___/______ ___ _/ /____   / _ )___  ___ ________/ /
+ / / / / _ \/ _  / / /__/ __/ -/) _  / __/ -/) / _  / _ \/ _ `/ __/ _  /
+/_/ /_/_//_/\_,_/  \___/_/  \__/\_,_/\__/\__/ /____/\___/\_,_/_/  \_,_/
+
+-------------------------------------------------------------------------'''
+    print(ascii_art)
+
+
+def init_cfgval():
+    global config_file
+    global syconfig_path
+    global build_dir
+    global kernel_dts_path
+    global uboot_dts_path
+    global kernel_defconf
+    global top_dir
+    global kerenl_ver
+    global board_config_dir
+    global kernel_src_path
+    global bsp_path
+    global kernel_cross_compile
+    global search_list
+    global rtos_project, rtos_device, rtos_plat
+    global board_config_name
+    global lichee_ic
+
+    board_config_dir = configs['LICHEE_BOARD_CONFIG_DIR']
+    linux_dev = configs['LICHEE_LINUX_DEV']
+    kerenl_ver = configs['LICHEE_KERN_VER']
+
+    search_list = [
+        # 1. ${LICHEE_BOARD_CONFIG_DIR}/${LICHEE_LINUX_DEV}/
+        '{}/{}'.format(board_config_dir, linux_dev),
+        # 2. ${LICHEE_BOARD_CONFIG_DIR}/${LICHEE_KERN_VER}/
+        '{}/{}'.format(board_config_dir, kerenl_ver),
+        # 3. ${LICHEE_BOARD_CONFIG_DIR}/
+        '{}'.format(board_config_dir),
+        # 4. ${LICHEE_BOARD_CONFIG_DIR}/../default/
+        '{}/../default'.format(board_config_dir),
+    ]
+
+    if board_config_dir == None:
+        print("LICHEE_BOARD_CONFIG_DIR not set in %s" % args.buildconfig)
+        sys.exit(1)
+
+    board_config_name = os.path.basename(board_config_dir)
+
+    syconfig_path = board_config_dir + '/sys_config.fex'
+    if not os.path.exists(syconfig_path):
+        print("%s is not exists" % syconfig_path)
+        sys.exit(1)
+
+    kernel_src_path = configs['LICHEE_KERN_DIR']
+    if not os.path.exists(kernel_src_path):
+        print("%s is not exists" % kernel_src_path)
+        sys.exit(1)
+
+    cmd = 'find {} -perm /a+x -a -regex \'.*-gcc\' | head -n 1'.format(configs['LICHEE_TOOLCHAIN_PATH'])
+    ret, kernel_cross_compile = do_cmd_with_output(cmd)
+    if ret != 0:
+        print('exec {} fialed!,ret = {}'.format(cmd, ret))
+        sys.exit(1)
+    kernel_cross_compile = kernel_cross_compile[:-4]
+
+    bsp_path = configs['LICHEE_BSP_DIR']
+    if not os.path.exists(bsp_path):
+        print("%s is not exists" % bsp_path)
+
+    kernel_dts_path = board_config_dir + '/{}/board.dts'.format(kerenl_ver)
+    if not os.path.exists(kernel_dts_path):
+        kernel_dts_path = board_config_dir + '/board.dts'
+    if not os.path.exists(kernel_dts_path):
+        print("%s is not exists" % kernel_dts_path)
+        sys.exit(1)
+
+    kernel_defconf = configs['LICHEE_KERN_DEFCONF_ABSOLUTE']
+    if not os.path.exists(kernel_defconf):
+        print("%s is not exists" % kernel_defconf)
+        sys.exit(1)
+
+    top_dir = configs['LICHEE_TOP_DIR']
+    if not os.path.exists(top_dir):
+        print("%s is not exists" % top_dir)
+        sys.exit(1)
+
+    lichee_ic = configs['LICHEE_IC']
+    if lichee_ic == None:
+        print("%s is not exists" % lichee_ic)
+        sys.exit(1)
+
+    uboot_ver = configs['LICHEE_BRANDY_UBOOT_VER']
+    uboot_dts_path = board_config_dir + '/uboot-{}/uboot-board.dts'.format(uboot_ver)
+    if not os.path.exists(uboot_dts_path):
+        uboot_dts_path = board_config_dir + '/uboot-board.dts'
+    if not os.path.exists(uboot_dts_path):
+        print("%s is not exists" % uboot_dts_path)
+        uboot_dts_path = None
+
+    build_dir = configs['LICHEE_BUILD_DIR']
+    if build_dir == None:
+        print("LICHEE_BUILD_DIR not set in %s" % args.buildconfig)
+        sys.exit(1)
+
+    rtos_project = configs['LICHEE_RTOS_PROJECT_NAME']
+    cmd = 'find {}/rtos/lichee/rtos/projects/ -maxdepth 2 -mindepth 2 -type d'.format(top_dir)
+    ret, rtos_prjs = do_cmd_with_output(cmd)
+    if ret == 0:
+        for p in rtos_prjs.split():
+            p = p.partition('{}/rtos/lichee/rtos/projects/'.format(top_dir))[2]
+            if p.replace('/', '_') == rtos_project:
+                rtos_device = p.split('/')[0]
+                rtos_plat = p.split('/')[1]
+    else:
+        print("scan {}/rtos/lichee/rtos/projects/ fialed".format(top_dir))
+        rtos_device = None
+        rtos_plat = None
+
+    if rtos_device == None:
+        rtos_project = None
+
+
+def backup_file(target):
+    file_name = target + '.backup'
+    if not os.path.exists(file_name):
+        do_cmd('cp {} {}'.format(target, file_name))
+
+
+def restore_file(target):
+    file_name = target + '.backup'
+    do_cmd('mv {} {}'.format(file_name, target))
+
+
+def record_diff(target):
+    file_name = target + '.backup'
+    do_cmd('echo "diff {}" >> {}'.format(target, diff_summary))
+    do_cmd('diff {} {} >> {}'.format(file_name, target, diff_summary))
+    do_cmd('rm {}'.format(file_name))
+
+
+def parse_board_cfg(BoardConfig, val):
+    if not isinstance(val, dict):
+        print('partition : invalid format, need dict')
+        sys.exit(1)
+
+    backup_file(BoardConfig)
+    for k, v in val.items():
+        cmd = 'grep -Eo \'{}\' {}'.format(k, BoardConfig)
+        ret, out = do_cmd_with_output(cmd)
+        if ret == 0:
+            if v != None:
+                cmd = 'sed -i \'s/^{}:=.*/{}:={}/g\' {}'.format(k, k, v, BoardConfig)
+            else:
+                cmd = 'sed -i \'/{}:=/d\' {}'.format(k, BoardConfig)
+        else:
+            if v != None:
+                cmd = 'echo "{}:={}" >> {}'.format(k, v, BoardConfig)
+        do_cmd(cmd)
+    record_diff(BoardConfig)
+    return
+
+
+def replace_string_in_file(file_path, old_string, new_string):
+    if os.path.exists(file_path):
+        with open(file_path, 'r', encoding='utf-8') as file:
+            content = file.read()
+        content = content.replace(old_string, new_string)
+        with open(file_path, 'w', encoding='utf-8') as file:
+            file.write(content)
+        # print(f"Successfully replaced '{old_string}' with '{new_string}' in {file_path}")
+        pass
+    else:
+        print(f"File {file_path} does not exist. Skipping.")
+        pass
+
+
+def create_device():
+    global board_config_dir
+    global new_board_name
+
+    new_board_device_dir = os.path.dirname(board_config_dir)
+    new_board_device_dir = os.path.join(new_board_device_dir, new_board_name)
+
+    do_cmd(f"mkdir -p {new_board_device_dir}")
+    do_cmd(f"cp -raf {board_config_dir}/* {new_board_device_dir}")
+
+    change_item = {
+        'LICHEE_RTOS_PROJECT_NAME': f'{lichee_ic}_e907_{new_board_name}'
+    }
+
+    linux_dev = configs['LICHEE_LINUX_DEV']
+    kerenl_ver = configs['LICHEE_KERN_VER']
+
+    search_list = [
+        # 1. ${LICHEE_BOARD_CONFIG_DIR}/${LICHEE_LINUX_DEV}/
+        '{}/{}'.format(new_board_device_dir, linux_dev),
+        # 2. ${LICHEE_BOARD_CONFIG_DIR}/${LICHEE_KERN_VER}/
+        '{}/{}'.format(new_board_device_dir, kerenl_ver),
+        # 3. ${LICHEE_BOARD_CONFIG_DIR}/
+        '{}'.format(new_board_device_dir),
+        # 4. ${LICHEE_BOARD_CONFIG_DIR}/../default/
+        '{}/../default'.format(new_board_device_dir),
+    ]
+
+    # modify BoardConfig rtos project path
+    BoardConfig = None
+    for p in search_list:
+        BoardConfig_path = '{}/BoardConfig.mk'.format(p)
+        if os.path.exists(BoardConfig_path):
+            BoardConfig = BoardConfig_path
+            break
+    if BoardConfig != None:
+        parse_board_cfg(BoardConfig, change_item)
+    else:
+        print('BoardConfig not exist, skip BoardConfig item')
+
+    for p in search_list:
+        BoardConfig_path = '{}/BoardConfig_nor.mk'.format(p)
+        if os.path.exists(BoardConfig_path):
+            BoardConfig = BoardConfig_path
+            break
+    if BoardConfig != None:
+        parse_board_cfg(BoardConfig, change_item)
+    else:
+        print('BoardConfig not exist, skip BoardConfig item')
+
+
+def create_openwrt_target():
+    global new_board_name
+
+    lichee_ic = configs['LICHEE_IC']
+    lichee_orig_board = configs['LICHEE_BOARD']
+
+    openwrt_dir = f'{top_dir}/openwrt/openwrt/'
+    lichee_orig_board_path = f'{top_dir}/openwrt/target/{lichee_ic}/{lichee_ic}-{lichee_orig_board}'
+
+    lichee_new_board_path = f'{top_dir}/openwrt/target/{lichee_ic}/{lichee_ic}-{new_board_name}'
+    lichee_orig_board_setup_sh = f'{top_dir}/openwrt/target/{lichee_ic}/{lichee_ic}-{new_board_name}/{lichee_ic}_{lichee_orig_board}-setup.sh'
+    lichee_new_board_setup_sh = f'{top_dir}/openwrt/target/{lichee_ic}/{lichee_ic}-{new_board_name}/{lichee_ic}_{new_board_name}-setup.sh'
+    lichee_new_board_vendorsetup_sh = f'{top_dir}/openwrt/target/{lichee_ic}/{lichee_ic}-{new_board_name}/vendorsetup.sh'
+    lichee_new_board_makefile = f'{top_dir}/openwrt/target/{lichee_ic}/{lichee_ic}-{new_board_name}/Makefile'
+    lichee_new_board_defconfig = f'{top_dir}/openwrt/target/{lichee_ic}/{lichee_ic}-{new_board_name}/defconfig'
+    lichee_new_board_defconfig_ota = f'{top_dir}/openwrt/target/{lichee_ic}/{lichee_ic}-{new_board_name}/defconfig_ota'
+
+    do_cmd(f"mkdir -p {lichee_new_board_path}")
+    do_cmd(f"cp -raf {lichee_orig_board_path}/* {lichee_new_board_path}")
+    do_cmd(f"mv -f {lichee_orig_board_setup_sh} {lichee_new_board_setup_sh}")
+
+    replace_string_in_file(lichee_new_board_vendorsetup_sh, lichee_orig_board, new_board_name)
+    replace_string_in_file(lichee_new_board_makefile, lichee_orig_board, new_board_name)
+    replace_string_in_file(lichee_new_board_defconfig, f'CONFIG_TARGET_{lichee_ic}_{lichee_orig_board}',
+                           f'CONFIG_TARGET_{lichee_ic}_{new_board_name}')
+    replace_string_in_file(lichee_new_board_defconfig, f'CONFIG_TARGET_BOARD="{lichee_ic}-{lichee_orig_board}"',
+                           f'CONFIG_TARGET_BOARD="{lichee_ic}-{new_board_name}"')
+    replace_string_in_file(lichee_new_board_defconfig_ota, f'CONFIG_TARGET_{lichee_ic}_{lichee_orig_board}',
+                           f'CONFIG_TARGET_{lichee_ic}_{new_board_name}')
+    replace_string_in_file(lichee_new_board_defconfig_ota, f'CONFIG_TARGET_BOARD="{lichee_ic}-{lichee_orig_board}"',
+                           f'CONFIG_TARGET_BOARD="{lichee_ic}-{new_board_name}"')
+
+
+def create_rtos_device():
+    global new_board_name
+    global rtos_plat
+    global rtos_device
+
+    orig_board_path = f'{top_dir}/rtos/board/{rtos_device}/{rtos_plat}'
+    new_board_path = f'{top_dir}/rtos/board/{rtos_device}/{new_board_name}'
+
+    do_cmd(f"mkdir -p {new_board_path}")
+    do_cmd(f"cp -raf {orig_board_path}/* {new_board_path}")
+
+
+def insert_config_if_not_exists(kconfig_file, new_config):
+    with open(kconfig_file, 'r', encoding='utf-8') as file:
+        lines = file.readlines()
+
+    endchoice_index = None
+    for i, line in enumerate(lines):
+        if line.strip() == "endchoice":
+            endchoice_index = i
+            break
+
+    if endchoice_index is None:
+        print("Error: 'endchoice' not found in the Kconfig file.")
+        return
+
+    config_name = 'PROJECT_' + new_config.splitlines()[1].strip().split(' ')[1].upper() + '_' + \
+                  new_config.splitlines()[1].strip().split(' ')[2].upper()
+    config_name = config_name.replace('\"', '')
+    config_exists = False
+    for line in lines:
+        if line.strip().startswith(f'config {config_name}'):
+            config_exists = True
+            break
+
+    if not config_exists:
+        lines.insert(endchoice_index, new_config + "\n")
+
+    with open(kconfig_file, 'w', encoding='utf-8') as file:
+        file.writelines(lines)
+
+
+def insert_line_if_not_exists(file_path, new_line):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        lines = file.readlines()
+
+    if new_line + '\n' not in lines:
+        lines.insert(0, new_line + '\n')
+
+    with open(file_path, 'w', encoding='utf-8') as file:
+        file.writelines(lines)
+
+
+def replace_config_name_in_defconfig(defconfig_file, replacements):
+    with open(defconfig_file, 'r', encoding='utf-8') as file:
+        lines = file.readlines()
+    for i, line in enumerate(lines):
+        for old_key, new_key in replacements.items():
+            if line.startswith(old_key):
+                lines[i] = line.replace(old_key, new_key)
+    with open(defconfig_file, 'w', encoding='utf-8') as file:
+        file.writelines(lines)
+
+
+def create_rtos_project():
+    global new_board_name
+    global rtos_plat
+    global rtos_device
+
+    orig_path = f'{top_dir}/rtos/lichee/rtos/projects/{rtos_device}/{rtos_plat}'
+    new_path = f'{top_dir}/rtos/lichee/rtos/projects/{rtos_device}/{new_board_name}'
+
+    do_cmd(f"mkdir -p {new_path}")
+    do_cmd(f"cp -raf {orig_path}/* {new_path}")
+
+    plat_kconfig_path = f'{top_dir}/rtos/lichee/rtos/projects/Kconfig'
+    plat_makefile_path = f'{top_dir}/rtos/lichee/rtos/projects/{rtos_device}/Makefile'
+    plat_defconfig_path = f'{top_dir}/rtos/lichee/rtos/projects/{rtos_device}/{new_board_name}/defconfig'
+
+    old_config_name = f"PROJECT_{rtos_device.upper()}_{rtos_plat.upper()}"
+    new_config_name = f"PROJECT_{rtos_device.upper()}_{new_board_name.upper()}"
+
+    new_kconfig = f"""config {new_config_name}
+    bool "{rtos_device} {new_board_name} system"
+    select PROJECT_{rtos_device.upper()}
+    ---help---
+        the {rtos_device} {new_board_name} system
+"""
+    insert_config_if_not_exists(plat_kconfig_path, new_kconfig)
+
+    new_makefile = f"obj-$(CONFIG_{new_config_name}) += {new_board_name}/"
+    insert_line_if_not_exists(plat_makefile_path, new_makefile)
+
+    replacements = {
+        f"CONFIG_{old_config_name}": f"CONFIG_{new_config_name}"
+    }
+    replace_config_name_in_defconfig(plat_defconfig_path, replacements)
+
+def finish_show():
+    global new_board_name
+    print("-------------------------------------------------------------------------")
+    print(f"Board {new_board_name} now created. Please reload environment and lunch your new board:")
+    print(f"source build/envsetup.sh && lunch")
+    print
+
+if __name__ == "__main__":
+    try:
+        diff_summary = '{}/.quick_config.diff'.format(os.getcwd())
+        if os.path.exists(diff_summary):
+            do_cmd('rm {}'.format(diff_summary))
+        _load_config(args.buildconfig)
+        print_ascii_logo()
+        init_cfgval()
+        print(f"Base on board name: {lichee_ic}-{board_config_name}-tina")
+        new_board_name = input("Please input new board name (eg. custom_board): ")
+        if '-' in new_board_name:
+            print(f"Error: Please don't using '-' in board name")
+            sys.exit(1)
+        print(f"Start generate new board: {lichee_ic}-{new_board_name}-tina")
+        create_device()
+        create_openwrt_target()
+        create_rtos_device()
+        create_rtos_project()
+        finish_show()
+    except KeyboardInterrupt:
+        print("\n")
+        pass
+    except KeyError:
+        print("Please select a vaild config by the number.")
+    except Exception as e:
+        print("quick_config Internal error: {}: {}".format(type(e), str(e)))

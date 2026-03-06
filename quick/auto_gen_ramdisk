@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+
+import os, sys
+import argparse
+import re
+import subprocess
+
+sys.path.append(os.path.dirname(__file__)+'/pylib/json5-0.9.25')
+import json5
+
+parser = argparse.ArgumentParser()
+parser.add_argument("buildconfig", default="../.buildconfig",
+            help="the buildconfig file")
+parser.add_argument("--config", help="configuration ramdisk that need to gen")
+args = parser.parse_args()
+
+def panic_out(str):
+    print("\033[41m\033[37mRAMDISK PACK FAIL: [%s]\033[0m" % str)
+    print("\033[41m\033[37mCheck your %s config and build files\033[0m" % args.config)
+    sys.exit(1)
+
+if not os.path.exists(args.buildconfig):
+    panic_out("%s not exists" % args.buildconfig)
+
+configs = {}
+
+def do_cmd(cmd, env=None):
+    if env:
+        s = subprocess.Popen(cmd, env=env, shell=True)
+    else:
+        s = subprocess.Popen(cmd, shell=True)
+    return_code = s.wait()
+    return return_code
+
+def do_cmd_with_output(cmd, env=None):
+    if env:
+        s = subprocess.Popen(cmd, env=env, shell=True, stdout=subprocess.PIPE)
+    else:
+        s = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+    output = s.communicate()[0]
+    return_code = s.returncode
+    return return_code, output.decode()
+
+def _load_config(filepath):
+    pattern = re.compile(r'^export ([^\s]+)=(.*)$')
+    with open(filepath, "r") as f:
+        for line in f:
+            match = pattern.search(line)
+            if not match:
+                continue
+            key = match.group(1)
+            val = match.group(2)
+            configs[key] = val
+
+def parse_var(vars, var):
+    max_ref = 10
+    while max_ref > 0:
+        for k, v in vars.items():
+            var = var.replace('${%s}' % (k), v)
+        if '$' not in var:
+            break
+        max_ref = max_ref - 1
+    if '$' in var:
+        panic_out('unknow \"{}\" var.'.format(var))
+    return var
+
+def copy_ramdisk_file(config_file):
+    global configs
+
+    if not os.path.exists(config_file):
+        panic_out('{} is not exist'.format(config_file))
+
+    with open(config_file, "r") as json_file:
+        data = json5.load(json_file)
+
+    if 'auto_copy' not in data.keys():
+        panic_out('{} is not exist, skip'.format('auto_copy'))
+    if 'compress' not in data.keys():
+        panic_out('{} is not exist, skip'.format('compress'))
+
+    builtin_var = {}
+    ignore_builtin = [
+        'auto_copy'
+    ]
+
+    for k1, v1 in data.items():
+        if not isinstance(v1, str):
+            continue
+        if k1 in ignore_builtin:
+            continue
+        builtin_var[k1] = v1
+
+    # prepare default builtin var
+    builtin_var['rootfs'] = '{}/out/{}/{}/{}/build_dir/target/root-{}-{}'.format(configs['LICHEE_TOP_DIR'],
+                configs['LICHEE_IC'], configs['LICHEE_BOARD'], configs['LICHEE_LINUX_DEV'],
+                configs['LICHEE_IC'], configs['LICHEE_BOARD'])
+    builtin_var['configs'] = configs['LICHEE_BOARD_CONFIG_DIR']
+    builtin_var['plat'] = '{}/openwrt/target/{}/{}-{}'.format(
+                configs['LICHEE_TOP_DIR'], configs['LICHEE_IC'],
+                configs['LICHEE_IC'], configs['LICHEE_BOARD'])
+
+    if 'src' not in data.keys():
+        ramdisk_dir = configs['LICHEE_BOARD_CONFIG_DIR'] + '/ramdisk'
+    else:
+        ramdisk_dir = parse_var(builtin_var, data['src'])
+
+    # output name
+    ramdisk_name = '{}/initramfs_{}.fex'.format(configs['LICHEE_BOARD_CONFIG_DIR'], data['compress'])
+
+    print('update ramdisk : {}'.format(ramdisk_name))
+
+    if 'auto_copy' in data.keys():
+        for k1, v1 in data['auto_copy'].items():
+            v1 = parse_var(builtin_var, v1)
+            print('cp file: {} -> {}'.format(v1, k1))
+            if not os.path.exists(v1):
+                panic_out('{} is not exist'.format(v1))
+            k1 = ramdisk_dir + '/' + k1
+            if not os.path.exists(os.path.dirname(k1)):
+                do_cmd('mkdir -p {}'.format(os.path.dirname(k1)))
+            do_cmd('cp {} {}'.format(v1, k1))
+
+    if 'cmd' in data.keys():
+        for v in data['cmd']:
+            v = parse_var(builtin_var, v)
+            ret, out = do_cmd_with_output(v)
+            if ret != 0:
+                print('do_cmd: {} failed'.format(v))
+                print('{}'.format(out))
+
+    # mk_ramdisk
+    if data['compress'] == 'lz4':
+        compr="lz4 -l -9 -f";
+    elif data['compress'] == 'gz' or data['compress'] == 'gzip':
+        compr="gzip -n -9 -f";
+    elif data['compress'] == 'bz2':
+        compr="bzip2 -9 -f";
+    elif data['compress'] == 'lzma':
+        compr="lzma -9 -f";
+    elif data['compress'] == 'xz':
+        compr="xz --check=crc32 --lzma2=dict=1MiB";
+    else:
+        panic_out("unsupport decompress type: {}".format(data['compress']))
+
+    tmp_file = '{}/.tmp_ramdisk'.format(os.getcwd())
+    do_cmd("cd {}; find . | fakeroot cpio -o -Hnewc | {} > {};\n".format(ramdisk_dir, compr, tmp_file))
+    with open(ramdisk_name, 'wb') as f:
+        f.write(bytearray(b"AWRD"))
+        f.write(int(os.path.getsize(tmp_file)).to_bytes(4, byteorder = 'little'))
+        with open(tmp_file, 'rb') as ff:
+            f.write(ff.read())
+    do_cmd('rm {};'.format(tmp_file))
+    print('ramdisk src dir: {}'.format(ramdisk_dir))
+    print('update ramdisk: {} done'.format(ramdisk_name))
+
+
+if __name__ == "__main__":
+    try:
+        _load_config(args.buildconfig)
+        copy_ramdisk_file(args.config)
+    except KeyboardInterrupt:
+        print("\n")
+        pass
+    except Exception as e:
+        print("auto_gen_ramdisk Internal error: {}: {}".format(type(e), str(e)))
